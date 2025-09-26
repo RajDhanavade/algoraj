@@ -1,170 +1,172 @@
-# Final Backtesting Script for the IBS Strategy
-
-import pandas as pd
-import numpy as np
-import pickle
 import yfinance as yf
-import os
+import pandas as pd
 
 # --- Configuration ---
-DATA_FILE = 'nifty50_data.pkl'
-NIFTY50_SYMBOLS = [
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "CIPLA",
-    "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH",
-    "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDUNILVR",
-    "ICICIBANK", "INDUSINDBK", "INFY", "ITC", "JIOFIN", "JSWSTEEL",
-    "KOTAKBANK", "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
-    "POWERGRID", "RELIANCE", "SBILIFE", "SHRIRAMFIN", "SBIN", "SUNPHARMA",
-    "TCS", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TECHM", "TITAN",
-    "TRENT", "ULTRACEMCO", "WIPRO"
+# Step 1: Setup Nifty 50 Stock Symbols
+nifty_50_symbols = [
+    "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
+    "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BPCL.NS", "BHARTIARTL.NS",
+    "BRITANNIA.NS", "CIPLA.NS", "COALINDIA.NS", "DIVISLAB.NS", "DRREDDY.NS",
+    "EICHERMOT.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS",
+    "HEROMOTOCO.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ICICIBANK.NS", "ITC.NS",
+    "INDUSINDBK.NS", "INFY.NS", "JSWSTEEL.NS", "KOTAKBANK.NS", "LTIM.NS",
+    "LT.NS", "M&M.NS", "MARUTI.NS", "NTPC.NS", "NESTLEIND.NS", "ONGC.NS",
+
+    "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SHRIRAMFIN.NS", "SBIN.NS",
+    "SUNPHARMA.NS", "TCS.NS", "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS",
+    "TECHM.NS", "TITAN.NS", "ULTRACEMCO.NS", "WIPRO.NS"
 ]
 
-# --- Data Handling ---
-
-def download_nifty50_data(symbols, filepath):
+# Step 2: Download Stock Data
+def download_data(symbols):
     """
-    Downloads historical data for Nifty 50 stocks for the last 5 years
-    and saves it to a pickle file.
+    Downloads one month of 5-minute intraday data for the given symbols.
     """
-    print("Downloading Nifty 50 historical data (last 5 years)...")
-    tickers = [symbol + ".NS" for symbol in symbols]
-    data = yf.download(tickers, period="5y", group_by='ticker')
-
-    with open(filepath, 'wb') as f:
-        pickle.dump(data, f)
-    print(f"Data downloaded and saved to {filepath}")
+    data = yf.download(tickers=symbols, period="1mo", interval="5m", group_by='ticker')
     return data
 
-def load_data(filepath, symbols):
+# Step 3: Calculate Camarilla Pivot Points
+def calculate_camarilla_pivots(previous_day_data):
     """
-    Loads the pickled stock data. If the file doesn't exist, it triggers the download.
+    Calculates Camarilla pivot points for the given stock data.
     """
-    if os.path.exists(filepath):
-        print(f"Loading data from {filepath}...")
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-        return data
-    else:
-        print(f"{filepath} not found.")
-        return download_nifty50_data(symbols, filepath)
+    high = previous_day_data['High']
+    low = previous_day_data['Low']
+    close = previous_day_data['Close']
 
-# --- Strategy and Backtesting ---
+    pivot = (high + low + close) / 3
+    range_ = high - low
 
-def calculate_ibs(data):
+    pivots = {
+        'R5': (high / low) * close,
+        'R4': close + (range_ * 1.1 / 2),
+        'R3': close + (range_ * 1.1 / 4),
+        'R2': close + (range_ * 1.1 / 6),
+        'R1': close + (range_ * 1.1 / 12),
+        'S1': close - (range_ * 1.1 / 12),
+        'S2': close - (range_ * 1.1 / 6),
+        'S3': close - (range_ * 1.1 / 4),
+        'S4': close - (range_ * 1.1 / 2),
+    }
+    pivots['S5'] = close - (pivots['R5'] - close)
+    return pivots
+
+# Step 4: Run the Backtest
+def run_backtest(data, symbols):
     """
-    Calculates the Internal Bar Strength (IBS) for each stock in the dataset.
-    IBS = (Close - Low) / (High - Low)
+    Runs the backtest for the Camarilla breakout strategy.
     """
-    print("Calculating Internal Bar Strength (IBS)...")
-    close_prices = data.xs('Close', level='Price', axis=1)
-    low_prices = data.xs('Low', level='Price', axis=1)
-    high_prices = data.xs('High', level='Price', axis=1)
+    trade_log = []
 
-    ibs = (close_prices - low_prices) / (high_prices - low_prices)
-    return ibs
+    unique_days = data.index.normalize().unique()
 
-def run_backtest(data, ibs_data):
+    for i in range(1, len(unique_days)):
+        previous_day = unique_days[i-1]
+        current_day = unique_days[i]
+
+        for symbol in symbols:
+            if symbol not in data.columns.get_level_values(0):
+                continue
+
+            symbol_data = data[symbol].dropna()
+
+            previous_day_data = symbol_data.loc[symbol_data.index.normalize() == previous_day]
+            if previous_day_data.empty:
+                continue
+
+            prev_day_high = previous_day_data['High'].max()
+            prev_day_low = previous_day_data['Low'].min()
+            prev_day_close = previous_day_data['Close'].iloc[-1]
+
+            pivots = calculate_camarilla_pivots({
+                'High': prev_day_high,
+                'Low': prev_day_low,
+                'Close': prev_day_close
+            })
+            r5 = pivots['R5']
+            s5 = pivots['S5']
+
+            current_day_data = symbol_data.loc[symbol_data.index.normalize() == current_day]
+            if current_day_data.empty:
+                continue
+
+            entry_price = 0
+            trade_type = None
+
+            for _, row in current_day_data.iterrows():
+                if row['High'] > r5:
+                    trade_type = 'long'
+                    entry_price = r5
+                    break
+
+                if row['Low'] < s5:
+                    trade_type = 'short'
+                    entry_price = s5
+                    break
+
+            if trade_type:
+                exit_price = current_day_data['Close'].iloc[-1]
+
+                if trade_type == 'long':
+                    pnl = exit_price - entry_price
+                else:
+                    pnl = entry_price - exit_price
+
+                trade_log.append({
+                    'Symbol': symbol,
+                    'Date': current_day.date(),
+                    'Trade Type': trade_type,
+                    'Entry Price': entry_price,
+                    'Exit Price': exit_price,
+                    'PnL': pnl,
+                    'ROI': (pnl / entry_price) * 100
+                })
+
+    return pd.DataFrame(trade_log)
+
+# Step 5: Calculate and Display Performance
+def calculate_and_display_performance(trade_log):
     """
-    Runs the backtest for the IBS strategy.
-    - Longs the stock with the minimum IBS.
-    - Shorts the stock with the maximum IBS.
-    - Enters at the close of the current day and exits at the close of the next day.
+    Calculates and displays the performance of the backtest.
     """
-    print("Running backtest...")
-    close_prices = data.xs('Close', level='Price', axis=1)
-    daily_returns = []
-
-    for i in range(len(ibs_data) - 1):
-        current_day_ibs = ibs_data.iloc[i].dropna()
-
-        if len(current_day_ibs) < 2:
-            daily_returns.append(0)
-            continue
-
-        min_ibs_stock = current_day_ibs.idxmin()
-        max_ibs_stock = current_day_ibs.idxmax()
-
-        current_close_long = close_prices.at[ibs_data.index[i], min_ibs_stock]
-        next_close_long = close_prices.at[ibs_data.index[i+1], min_ibs_stock]
-
-        current_close_short = close_prices.at[ibs_data.index[i], max_ibs_stock]
-        next_close_short = close_prices.at[ibs_data.index[i+1], max_ibs_stock]
-
-        if pd.isna(current_close_long) or pd.isna(next_close_long) or \
-           pd.isna(current_close_short) or pd.isna(next_close_short):
-            daily_returns.append(0)
-            continue
-
-        long_return = (next_close_long - current_close_long) / current_close_long
-        short_return = -(next_close_short - current_close_short) / current_close_short
-
-        total_daily_return = (long_return + short_return) / 2
-        daily_returns.append(total_daily_return)
-
-    print("Backtest complete.")
-    return pd.Series(daily_returns, index=ibs_data.index[:-1])
-
-# --- Performance Analysis ---
-
-def calculate_performance_metrics(returns):
-    """
-    Calculates and prints key performance metrics for the strategy.
-    """
-    if returns is None or len(returns) == 0:
-        print("No returns to analyze.")
+    if trade_log.empty:
+        print("No trades were made during the backtest period.")
         return
 
-    cumulative_returns = (1 + returns).cumprod()
-    total_return = (cumulative_returns.iloc[-1] - 1) * 100
-    n_days = len(returns)
-    annualized_return = ((1 + returns.mean()) ** 252 - 1) * 100
-    annualized_volatility = (returns.std() * np.sqrt(252)) * 100
-    sharpe_ratio = (annualized_return / annualized_volatility) if annualized_volatility != 0 else 0
-    win_rate = (returns > 0).sum() / n_days * 100
+    total_trades = len(trade_log)
+    winning_trades = trade_log[trade_log['PnL'] > 0]
+    losing_trades = trade_log[trade_log['PnL'] <= 0]
 
-    running_max = np.maximum.accumulate(cumulative_returns)
-    drawdown = (cumulative_returns - running_max) / running_max
-    max_drawdown = np.min(drawdown) * 100
+    win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+    total_pnl = trade_log['PnL'].sum()
+    total_roi = trade_log['ROI'].sum()
 
-    print("\n--- Strategy Performance Metrics ---")
-    print(f"Backtest Period: {returns.index[0].date()} to {returns.index[-1].date()}")
-    print(f"Total Return: {total_return:.2f}%")
-    print(f"Annualized Return: {annualized_return:.2f}%")
-    print(f"Annualized Volatility: {annualized_volatility:.2f}%")
-    print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
-    print(f"Win Rate: {win_rate:.2f}%")
-    print(f"Maximum Drawdown: {max_drawdown:.2f}%")
-    print("------------------------------------")
+    print("\n--- Trade Summary ---")
+    print(f"Total Trades: {total_trades}")
+    print(f"Winning Trades: {len(winning_trades)}")
+    print(f"Losing Trades: {len(losing_trades)}")
+    print(f"Win-Loss Ratio: {win_rate:.2f}%")
+    print(f"Total PnL: {total_pnl:.2f}")
+    print(f"Monthly ROI: {total_roi:.2f}%")
+    print("---------------------\n")
 
-# --- Main Execution ---
+    print("Trade Log:")
+    print(trade_log)
 
+# Step 6: Execute the Backtest
 if __name__ == "__main__":
-    """
-    This script runs a backtest of a trading strategy based on the
-    Internal Bar Strength (IBS) indicator on Nifty 50 stocks.
+    print("Starting the backtest...")
 
-    The strategy is as follows:
-    - Each day, calculate the IBS for all Nifty 50 stocks.
-    - Go long on the stock with the lowest IBS.
-    - Go short on the stock with the highest IBS.
-    - Positions are entered at the close of the day and exited at the close of the next day.
+    # Download data for all Nifty 50 stocks
+    nifty_data = download_data(nifty_50_symbols)
 
-    The script will automatically download the required historical data if it's not
-    found locally.
-    """
+    if not nifty_data.empty:
+        # Run the backtest
+        trade_log = run_backtest(nifty_data, nifty_50_symbols)
 
-    # 1. Load data (or download if it doesn't exist)
-    nifty_data = load_data(DATA_FILE, NIFTY50_SYMBOLS)
-
-    if nifty_data is not None and not nifty_data.empty:
-        # 2. Calculate IBS
-        ibs_data = calculate_ibs(nifty_data)
-
-        # 3. Run the backtest
-        strategy_returns = run_backtest(nifty_data, ibs_data)
-
-        # 4. Calculate and display performance
-        calculate_performance_metrics(strategy_returns)
+        # Calculate and display performance
+        calculate_and_display_performance(trade_log)
     else:
-        print("Could not load or download data. Exiting.")
+        print("Failed to download data. The backtest cannot proceed.")
+
+    print("Backtest finished.")
