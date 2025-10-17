@@ -15,14 +15,15 @@ TRADING_SYMBOL = "RELIANCE"
 EXCHANGE = "NSE"
 TIMEFRAME = "5minute"
 INITIAL_CAPITAL = 100000
-TRADE_LOG_FILE = 'reversal_trades.csv'
+TRADE_LOG_FILE = 'reversal_trades_long_only.csv'
+QUANTITY = 1 # Testing with 1 share
 
 # --- Strategy Parameters ---
 DONCHIAN_PERIOD = 20
-SYSTEM_STOP_LOSS_PCT = 5.0
+SYSTEM_STOP_LOSS_PCT = 5.0 # 5% of entry capital for the position
 
 # --- Advanced Features ---
-LEVERAGE = 2.0
+LEVERAGE = 1.0 # No leverage for testing
 BROKERAGE_FEE_PCT = 0.05
 SLIPPAGE_PCT = 0.02
 
@@ -34,7 +35,6 @@ def get_instrument_token(kite, symbol):
         instruments = kite.instruments(exchange=EXCHANGE)
         for instrument in instruments:
             if instrument['tradingsymbol'] == symbol:
-                logging.info(f"Instrument token for {symbol}: {instrument['instrument_token']}")
                 return instrument['instrument_token']
         raise ValueError(f"Instrument token for {symbol} not found.")
     except Exception as e:
@@ -45,13 +45,12 @@ def download_data_from_zerodha(kite, instrument_token, timeframe):
     """Downloads historical data from Zerodha Kite API."""
     print(f"Downloading data for instrument {instrument_token} with timeframe {timeframe}...")
     try:
-        from_date = pd.Timestamp.now() - pd.Timedelta(days=59) # Max 60 days for 5-min data
+        from_date = pd.Timestamp.now() - pd.Timedelta(days=59)
         to_date = pd.Timestamp.now()
         records = kite.historical_data(instrument_token, from_date, to_date, timeframe)
         df = pd.DataFrame(records)
         df['date'] = pd.to_datetime(df['date'])
 
-        # Convert timestamps to Indian Standard Time (IST)
         if df['date'].dt.tz is None:
             df['date'] = df['date'].dt.tz_localize('UTC')
         df['date'] = df['date'].dt.tz_convert('Asia/Kolkata')
@@ -71,80 +70,57 @@ def calculate_donchian_channel(data, period):
 
 def run_backtest(data, initial_capital):
     """
-    Runs the backtest for a simple stop-and-reverse Donchian Channel strategy.
+    Runs the backtest for a long-only Donchian Channel strategy.
     """
-    print("Running stop-and-reverse backtest...")
+    print("Running long-only backtest...")
     trade_log = []
-    position = None
+    in_position = False
     entry_price = 0
     cost_basis = 0
-    shares = 0
     entry_time = None
 
     for index, row in data.iterrows():
         if pd.isna(row['lower_band']):
             continue
 
-        if position is not None:
-            pnl_pct = 0
-            if position == 'long':
-                pnl_pct = ((row['close'] - entry_price) / entry_price) * 100
-            elif position == 'short':
-                pnl_pct = ((entry_price - row['close']) / entry_price) * 100
-
-            if pnl_pct <= -SYSTEM_STOP_LOSS_PCT:
-                exit_price = row['close'] * (1 - SLIPPAGE_PCT / 100) if position == 'long' else row['close'] * (1 + SLIPPAGE_PCT / 100)
-                brokerage = exit_price * shares * (BROKERAGE_FEE_PCT / 100)
-                net_pnl = ((exit_price * shares) - cost_basis - brokerage) if position == 'long' else (cost_basis - (exit_price * shares) - brokerage)
-
+        # --- Exit Logic ---
+        if in_position:
+            # Stop-Loss Check
+            if row['low'] <= entry_price * (1 - SYSTEM_STOP_LOSS_PCT / 100):
+                exit_price = row['low'] * (1 - SLIPPAGE_PCT / 100)
+                brokerage = exit_price * QUANTITY * (BROKERAGE_FEE_PCT / 100)
+                net_pnl = (exit_price * QUANTITY) - cost_basis - brokerage
                 trade_log.append({
-                    'entry_time': entry_time, 'entry_price': entry_price, 'position_type': position,
-                    'exit_time': row['date'], 'exit_price': exit_price, 'pnl': net_pnl, 'shares': shares,
+                    'entry_time': entry_time, 'entry_price': entry_price,
+                    'exit_time': row['date'], 'exit_price': exit_price, 'pnl': net_pnl, 'shares': QUANTITY,
                     'exit_reason': 'Stop-Loss'
                 })
-                print(f"{row['date']} - STOP-LOSS triggered on {position} position. PnL: {net_pnl:.2f}")
-                position, entry_price, cost_basis, shares, entry_time = None, 0, 0, 0, None
+                print(f"{row['date']} - Stop-Loss triggered. Exiting at {exit_price:.2f}. PnL: {net_pnl:.2f}")
+                in_position, entry_price, cost_basis, entry_time = False, 0, 0, None
                 continue
 
-        if row['low'] <= row['lower_band']:
-            if position == 'short':
-                exit_price = row['lower_band'] * (1 + SLIPPAGE_PCT / 100)
-                brokerage = exit_price * shares * (BROKERAGE_FEE_PCT / 100)
-                net_pnl = (cost_basis - (exit_price * shares) - brokerage)
-                trade_log.append({
-                    'entry_time': entry_time, 'entry_price': entry_price, 'position_type': 'short',
-                    'exit_time': row['date'], 'exit_price': exit_price, 'pnl': net_pnl, 'shares': shares,
-                    'exit_reason': 'Reverse to Long'
-                })
-                print(f"{row['date']} - Closing SHORT, opening LONG. PnL: {net_pnl:.2f}")
-
-            if position != 'long':
-                position = 'long'
-                entry_price = row['lower_band'] * (1 + SLIPPAGE_PCT / 100)
-                shares = int((initial_capital * LEVERAGE) / entry_price)
-                brokerage = entry_price * shares * (BROKERAGE_FEE_PCT / 100)
-                cost_basis = (entry_price * shares) + brokerage
-                entry_time = row['date']
-
-        elif row['high'] >= row['upper_band']:
-            if position == 'long':
+            # Take-Profit Check
+            elif row['high'] >= row['upper_band']:
                 exit_price = row['upper_band'] * (1 - SLIPPAGE_PCT / 100)
-                brokerage = exit_price * shares * (BROKERAGE_FEE_PCT / 100)
-                net_pnl = (exit_price * shares) - cost_basis - brokerage
+                brokerage = exit_price * QUANTITY * (BROKERAGE_FEE_PCT / 100)
+                net_pnl = (exit_price * QUANTITY) - cost_basis - brokerage
                 trade_log.append({
-                    'entry_time': entry_time, 'entry_price': entry_price, 'position_type': 'long',
-                    'exit_time': row['date'], 'exit_price': exit_price, 'pnl': net_pnl, 'shares': shares,
-                    'exit_reason': 'Reverse to Short'
+                    'entry_time': entry_time, 'entry_price': entry_price,
+                    'exit_time': row['date'], 'exit_price': exit_price, 'pnl': net_pnl, 'shares': QUANTITY,
+                    'exit_reason': 'Take-Profit'
                 })
-                print(f"{row['date']} - Closing LONG, opening SHORT. PnL: {net_pnl:.2f}")
+                print(f"{row['date']} - Take-Profit triggered. Exiting at {exit_price:.2f}. PnL: {net_pnl:.2f}")
+                in_position, entry_price, cost_basis, entry_time = False, 0, 0, None
+                continue
 
-            if position != 'short':
-                position = 'short'
-                entry_price = row['upper_band'] * (1 - SLIPPAGE_PCT / 100)
-                shares = int((initial_capital * LEVERAGE) / entry_price)
-                brokerage = entry_price * shares * (BROKERAGE_FEE_PCT / 100)
-                cost_basis = (entry_price * shares) + brokerage
-                entry_time = row['date']
+        # --- Entry Logic ---
+        if not in_position and row['low'] <= row['lower_band']:
+            in_position = True
+            entry_price = row['lower_band'] * (1 + SLIPPAGE_PCT / 100)
+            brokerage = entry_price * QUANTITY * (BROKERAGE_FEE_PCT / 100)
+            cost_basis = (entry_price * QUANTITY) + brokerage
+            entry_time = row['date']
+            print(f"{row['date']} - BUY signal. Entering at {entry_price:.2f}")
 
     print("Backtest complete.")
     return pd.DataFrame(trade_log)
