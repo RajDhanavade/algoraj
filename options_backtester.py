@@ -112,10 +112,10 @@ def calculate_donchian_channel(data, period):
     return data
 
 def find_option_to_trade(underlying_spot, option_type, current_date, instruments_df):
-    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt.date() >= current_date.date()])
+    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt >= current_date.to_pydatetime().date()])
     if not future_expiries: return None, None, None
 
-    monthly_expiry = next((expiry for expiry in future_expiries if expiry.is_month_end), None)
+    monthly_expiry = next((expiry for expiry in pd.to_datetime(future_expiries) if expiry.is_month_end), None)
     if not monthly_expiry: return None, None, None
 
     filtered_options = instruments_df[(instruments_df['expiry'] == monthly_expiry) & (instruments_df['instrument_type'] == option_type)]
