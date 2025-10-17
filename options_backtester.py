@@ -7,13 +7,14 @@ from datetime import datetime, timedelta
 import time
 import webbrowser
 import threading
-from flask import Flask, request, render_template_string
+from flask import Flask, request
 
 # --- Configuration ---
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
 
 # --- Backtest Period Configuration ---
+# Set the start and end dates for your backtest. Format: 'YYYY-MM-DD'
 FROM_DATE = (datetime.now() - timedelta(days=59)).strftime('%Y-%m-%d')
 TO_DATE = datetime.now().strftime('%Y-%m-%d')
 
@@ -43,16 +44,14 @@ log.setLevel(logging.ERROR)
 def redirect_url_handler():
     global access_token_global
     request_token = request.args.get("request_token")
-    if not request_token:
-        return "<html><body><h1>Login failed.</h1></body></html>"
+    if not request_token: return "<h1>Login failed.</h1>"
     try:
         data = kite.generate_session(request_token, api_secret=API_SECRET)
         access_token_global = data["access_token"]
         logging.info("Access token generated successfully!")
-        return render_template_string("<html><body><h1>Login Successful!</h1><p>You can close this tab. The backtest is running in your terminal.</p></body></html>")
+        return "<h1>Login Successful!</h1><p>You can close this tab. The backtest is running in your terminal.</p>"
     except Exception as e:
-        logging.error(f"Error generating access token: {e}")
-        return f"<html><body><h1>Error: {e}</h1></body></html>"
+        return f"<h1>Error: {e}</h1>"
 
 def run_server():
     server_started.set()
@@ -61,21 +60,15 @@ def run_server():
 def get_access_token_automated(api_key):
     global kite
     kite = KiteConnect(api_key=api_key)
-
     print("--- Zerodha Login ---")
     print("IMPORTANT: Your Zerodha App's Redirect URL must be set to: http://127.0.0.1:5000/redirect")
-
     server_thread = threading.Thread(target=run_server)
     server_thread.daemon = True
     server_thread.start()
-
-    server_started.wait(timeout=5) # Wait for server to start
+    server_started.wait(timeout=5)
     webbrowser.open(kite.login_url())
     logging.info("Please complete the login in your browser...")
-
-    while access_token_global is None:
-        time.sleep(1)
-
+    while access_token_global is None: time.sleep(1)
     return access_token_global
 
 # --- Backtesting Core Logic ---
@@ -95,7 +88,6 @@ def download_historical_data(kite, instrument_token, timeframe, from_date, to_da
             df['date'] = pd.to_datetime(df['date']).dt.tz_convert('Asia/Kolkata')
         return df
     except Exception as e:
-        logging.error(f"Error downloading data for {instrument_token}: {e}")
         return pd.DataFrame()
 
 def pre_fetch_all_data(kite, index_token, instruments_df, from_date, to_date):
@@ -103,7 +95,7 @@ def pre_fetch_all_data(kite, index_token, instruments_df, from_date, to_date):
     index_data = download_historical_data(kite, index_token, TIMEFRAME, from_date, to_date)
     if index_data.empty: raise ValueError("Could not download index data.")
 
-    monthly_expiries = sorted(list(instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'] >= from_date.date()) & (instruments_df['expiry'] <= to_date.date() + timedelta(days=35)) & (instruments_df['expiry'].apply(lambda x: x.is_month_end))]['expiry'].unique()))
+    monthly_expiries = sorted(list(instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'] >= from_date) & (instruments_df['expiry'] <= to_date + timedelta(days=35)) & (instruments_df['expiry'].apply(lambda x: x.is_month_end))]['expiry'].unique()))
     relevant_options = instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'].isin(monthly_expiries))]
 
     options_data_cache = {}
@@ -120,14 +112,10 @@ def calculate_donchian_channel(data, period):
     return data
 
 def find_option_to_trade(underlying_spot, option_type, current_date, instruments_df):
-    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt >= current_date.date()])
+    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt.date() >= current_date.date()])
     if not future_expiries: return None, None, None
 
-    monthly_expiry = None
-    for expiry in future_expiries:
-        if expiry.is_month_end:
-            monthly_expiry = expiry
-            break
+    monthly_expiry = next((expiry for expiry in future_expiries if expiry.is_month_end), None)
     if not monthly_expiry: return None, None, None
 
     filtered_options = instruments_df[(instruments_df['expiry'] == monthly_expiry) & (instruments_df['instrument_type'] == option_type)]
@@ -175,7 +163,7 @@ def run_backtest(index_data, instruments_df, options_cache):
         if (row['low'] <= row['lower_band'] and (not position or position['type'] == 'CALL')) or \
            (row['high'] >= row['upper_band'] and (not position or position['type'] == 'PUT')):
 
-            if position: # Reversal logic
+            if position:
                 exit_price = get_option_price(position['token'], row['date'], options_cache)
                 if exit_price:
                     pnl = (position['entry_premium'] - exit_price) * position['lot_size']
@@ -185,7 +173,7 @@ def run_backtest(index_data, instruments_df, options_cache):
                 position = None
 
             option_type = 'PE' if row['low'] <= row['lower_band'] else 'CE'
-            option_symbol, token, lot_size = find_option_to_trade(row['close'], option_type, row['date'].date(), instruments_df)
+            option_symbol, token, lot_size = find_option_to_trade(row['close'], option_type, row['date'], instruments_df)
 
             if option_symbol:
                 entry_premium = get_option_price(token, row['date'], options_cache)
