@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 from kiteconnect import KiteConnect
 import os
 import logging
@@ -13,19 +12,15 @@ from flask import Flask, request
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
 
-# --- Backtest Period Configuration ---
-# Set the start and end dates for your backtest. Format: 'YYYY-MM-DD'
-FROM_DATE = (datetime.now() - timedelta(days=59)).strftime('%Y-%m-%d')
-TO_DATE = datetime.now().strftime('%Y-%m-%d')
+FROM_DATE = "2024-08-01"
+TO_DATE = "2024-09-30"
 
-# --- Trading Parameters ---
 INDEX_SYMBOL = "NIFTY BANK"
 EXCHANGE_IND = "NSE"
 EXCHANGE_OPT = "NFO"
 INITIAL_CAPITAL = 300000
 TRADE_LOG_FILE = 'options_trades_final.csv'
 
-# --- Strategy Parameters ---
 TIMEFRAME = "5minute"
 DONCHIAN_PERIOD = 20
 TARGET_DELTA_PROXY_STRIKES = 3
@@ -37,6 +32,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 access_token_global = None
 server_started = threading.Event()
+kite = None
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
@@ -49,7 +45,7 @@ def redirect_url_handler():
         data = kite.generate_session(request_token, api_secret=API_SECRET)
         access_token_global = data["access_token"]
         logging.info("Access token generated successfully!")
-        return "<h1>Login Successful!</h1><p>You can close this tab. The backtest is running in your terminal.</p>"
+        return "<h1>Login Successful!</h1><p>You can close this tab.</p>"
     except Exception as e:
         return f"<h1>Error: {e}</h1>"
 
@@ -61,13 +57,13 @@ def get_access_token_automated(api_key):
     global kite
     kite = KiteConnect(api_key=api_key)
     print("--- Zerodha Login ---")
-    print("IMPORTANT: Your Zerodha App's Redirect URL must be set to: http://127.0.0.1:5000/redirect")
+    print("Redirect URL: http://127.0.0.1:5000/redirect")
     server_thread = threading.Thread(target=run_server)
     server_thread.daemon = True
     server_thread.start()
     server_started.wait(timeout=5)
     webbrowser.open(kite.login_url())
-    logging.info("Please complete the login in your browser...")
+    logging.info("Please complete login in your browser...")
     while access_token_global is None: time.sleep(1)
     return access_token_global
 
@@ -79,10 +75,10 @@ def get_instrument_token(kite, symbol, exchange):
             return instrument['instrument_token']
     raise ValueError(f"Token for {symbol} on {exchange} not found.")
 
-def download_historical_data(kite, instrument_token, timeframe, from_date, to_date):
-    logging.info(f"Downloading data for instrument {instrument_token}...")
+def download_historical_data(kite, instrument_token, from_date, to_date, timeframe):
+    logging.info(f"Downloading data for {instrument_token}...")
     try:
-        records = kite.historical_data(instrument_token, from_date, to_date, timeframe, continuous=False)
+        records = kite.historical_data(instrument_token, from_date, to_date, timeframe)
         df = pd.DataFrame(records)
         if not df.empty:
             df['date'] = pd.to_datetime(df['date']).dt.tz_convert('Asia/Kolkata')
@@ -92,18 +88,18 @@ def download_historical_data(kite, instrument_token, timeframe, from_date, to_da
 
 def pre_fetch_all_data(kite, index_token, instruments_df, from_date, to_date):
     logging.info("--- Starting Data Pre-Fetch Process ---")
-    index_data = download_historical_data(kite, index_token, TIMEFRAME, from_date, to_date)
+    index_data = download_historical_data(kite, index_token, from_date, to_date, TIMEFRAME)
     if index_data.empty: raise ValueError("Could not download index data.")
 
-    monthly_expiries = sorted(list(instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'] >= from_date) & (instruments_df['expiry'] <= to_date + timedelta(days=35)) & (instruments_df['expiry'].apply(lambda x: x.is_month_end))]['expiry'].unique()))
+    monthly_expiries = sorted(list(set(dt for dt in instruments_df['expiry'] if dt.is_month_end and dt.date() >= from_date.date() and dt.date() <= (to_date + timedelta(days=35)).date())))
     relevant_options = instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'].isin(monthly_expiries))]
 
     options_data_cache = {}
     for _, option in relevant_options.iterrows():
         token = option['instrument_token']
-        options_data_cache[token] = download_historical_data(kite, token, TIMEFRAME, from_date, to_date)
+        options_data_cache[token] = download_historical_data(kite, token, from_date, to_date, TIMEFRAME)
         time.sleep(0.4)
-    logging.info("--- Data Pre-Fetch Complete ---")
+    logging.info(f"--- Data Pre-Fetch Complete for {len(options_data_cache)} options ---")
     return index_data, options_data_cache
 
 def calculate_donchian_channel(data, period):
@@ -112,10 +108,10 @@ def calculate_donchian_channel(data, period):
     return data
 
 def find_option_to_trade(underlying_spot, option_type, current_date, instruments_df):
-    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt >= current_date.to_pydatetime().date()])
+    future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt.date() >= current_date.date()])
     if not future_expiries: return None, None, None
 
-    monthly_expiry = next((expiry for expiry in pd.to_datetime(future_expiries) if expiry.is_month_end), None)
+    monthly_expiry = next((expiry for expiry in future_expiries if expiry.is_month_end), None)
     if not monthly_expiry: return None, None, None
 
     filtered_options = instruments_df[(instruments_df['expiry'] == monthly_expiry) & (instruments_df['instrument_type'] == option_type)]
@@ -133,8 +129,7 @@ def get_option_price(token, timestamp, cache):
     if token in cache and not cache[token].empty:
         data = cache[token]
         price_row = data[data['date'] <= timestamp]
-        if not price_row.empty:
-            return price_row.iloc[-1]['close']
+        if not price_row.empty: return price_row.iloc[-1]['close']
     return None
 
 def run_backtest(index_data, instruments_df, options_cache):
@@ -156,7 +151,6 @@ def run_backtest(index_data, instruments_df, options_cache):
             if current_pnl <= stop_loss_pnl:
                 position.update({'exit_time': row['date'], 'exit_price': current_option_price, 'pnl': current_pnl, 'exit_reason': 'Stop-Loss'})
                 trade_log.append(position)
-                logging.info(f"Closed {position['symbol']} on Stop-Loss. PnL: {current_pnl:.2f}")
                 position = None
                 continue
 
@@ -169,7 +163,6 @@ def run_backtest(index_data, instruments_df, options_cache):
                     pnl = (position['entry_premium'] - exit_price) * position['lot_size']
                     position.update({'exit_time': row['date'], 'exit_price': exit_price, 'pnl': pnl, 'exit_reason': 'Reversal'})
                     trade_log.append(position)
-                    logging.info(f"Reversed {position['symbol']}. PnL: {pnl:.2f}")
                 position = None
 
             option_type = 'PE' if row['low'] <= row['lower_band'] else 'CE'
@@ -180,7 +173,6 @@ def run_backtest(index_data, instruments_df, options_cache):
                 if entry_premium:
                     margin = (row['close'] * 0.15 + entry_premium) * lot_size
                     position = {'entry_time': row['date'], 'symbol': option_symbol, 'type': 'PUT' if option_type == 'PE' else 'CALL', 'entry_premium': entry_premium, 'token': token, 'lot_size': lot_size, 'margin': margin}
-                    logging.info(f"Sold {option_symbol} at {entry_premium}")
 
     return pd.DataFrame(trade_log)
 
@@ -189,11 +181,9 @@ if __name__ == "__main__":
         logging.error("Please fill in your API_KEY and API_SECRET.")
     else:
         access_token = get_access_token_automated(API_KEY)
-
         if access_token:
             kite = KiteConnect(api_key=API_KEY)
             kite.set_access_token(access_token)
-
             try:
                 index_token = get_instrument_token(kite, INDEX_SYMBOL, EXCHANGE_IND)
                 nfo_instruments = pd.DataFrame(kite.instruments(exchange=EXCHANGE_OPT))
@@ -205,19 +195,16 @@ if __name__ == "__main__":
                 index_data, options_cache = pre_fetch_all_data(kite, index_token, nfo_instruments, from_date, to_date)
 
                 index_with_indicator = calculate_donchian_channel(index_data, DONCHIAN_PERIOD)
-
                 trade_log = run_backtest(index_with_indicator, nfo_instruments, options_cache)
 
                 if not trade_log.empty:
                     trade_log.to_csv(TRADE_LOG_FILE, index=False)
                     logging.info(f"Trade log saved to {TRADE_LOG_FILE}")
-                    print("\n--- Backtest Summary ---")
                     print(trade_log)
                     print(f"\nTotal PnL: {trade_log['pnl'].sum():.2f}")
                 else:
-                    logging.info("No trades were executed during the backtest.")
-
+                    logging.info("No trades were executed.")
             except Exception as e:
                 logging.error(f"An error occurred: {e}", exc_info=True)
         else:
-            logging.error("Could not obtain access token. Aborting backtest.")
+            logging.error("Could not obtain access token.")
