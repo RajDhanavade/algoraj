@@ -5,18 +5,26 @@ import os
 import logging
 from datetime import datetime, timedelta
 import time
+import webbrowser
+import threading
+from flask import Flask, request, render_template_string
 
 # --- Configuration ---
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
-ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
+# --- Backtest Period Configuration ---
+FROM_DATE = (datetime.now() - timedelta(days=59)).strftime('%Y-%m-%d')
+TO_DATE = datetime.now().strftime('%Y-%m-%d')
+
+# --- Trading Parameters ---
 INDEX_SYMBOL = "NIFTY BANK"
 EXCHANGE_IND = "NSE"
 EXCHANGE_OPT = "NFO"
 INITIAL_CAPITAL = 300000
-TRADE_LOG_FILE = 'options_trades_v2.csv'
+TRADE_LOG_FILE = 'options_trades_final.csv'
 
+# --- Strategy Parameters ---
 TIMEFRAME = "5minute"
 DONCHIAN_PERIOD = 20
 TARGET_DELTA_PROXY_STRIKES = 3
@@ -24,6 +32,53 @@ STOP_LOSS_PCT = 3.0
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Web Server for Authentication ---
+app = Flask(__name__)
+access_token_global = None
+server_started = threading.Event()
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+@app.route("/redirect")
+def redirect_url_handler():
+    global access_token_global
+    request_token = request.args.get("request_token")
+    if not request_token:
+        return "<html><body><h1>Login failed.</h1></body></html>"
+    try:
+        data = kite.generate_session(request_token, api_secret=API_SECRET)
+        access_token_global = data["access_token"]
+        logging.info("Access token generated successfully!")
+        return render_template_string("<html><body><h1>Login Successful!</h1><p>You can close this tab. The backtest is running in your terminal.</p></body></html>")
+    except Exception as e:
+        logging.error(f"Error generating access token: {e}")
+        return f"<html><body><h1>Error: {e}</h1></body></html>"
+
+def run_server():
+    server_started.set()
+    app.run(port=5000)
+
+def get_access_token_automated(api_key):
+    global kite
+    kite = KiteConnect(api_key=api_key)
+
+    print("--- Zerodha Login ---")
+    print("IMPORTANT: Your Zerodha App's Redirect URL must be set to: http://127.0.0.1:5000/redirect")
+
+    server_thread = threading.Thread(target=run_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+    server_started.wait(timeout=5) # Wait for server to start
+    webbrowser.open(kite.login_url())
+    logging.info("Please complete the login in your browser...")
+
+    while access_token_global is None:
+        time.sleep(1)
+
+    return access_token_global
+
+# --- Backtesting Core Logic ---
 def get_instrument_token(kite, symbol, exchange):
     instruments = kite.instruments(exchange=exchange)
     for instrument in instruments:
@@ -50,14 +105,11 @@ def pre_fetch_all_data(kite, index_token, instruments_df, from_date, to_date):
 
     monthly_expiries = sorted(list(instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'] >= from_date.date()) & (instruments_df['expiry'] <= to_date.date() + timedelta(days=35)) & (instruments_df['expiry'].apply(lambda x: x.is_month_end))]['expiry'].unique()))
     relevant_options = instruments_df[(instruments_df['name'] == 'BANKNIFTY') & (instruments_df['expiry'].isin(monthly_expiries))]
-    logging.info(f"Found {len(relevant_options)} relevant option contracts to pre-fetch.")
 
     options_data_cache = {}
     for _, option in relevant_options.iterrows():
         token = option['instrument_token']
-        opt_from_date = from_date
-        opt_to_date = to_date
-        options_data_cache[token] = download_historical_data(kite, token, TIMEFRAME, opt_from_date, opt_to_date)
+        options_data_cache[token] = download_historical_data(kite, token, TIMEFRAME, from_date, to_date)
         time.sleep(0.4)
     logging.info("--- Data Pre-Fetch Complete ---")
     return index_data, options_data_cache
@@ -69,14 +121,14 @@ def calculate_donchian_channel(data, period):
 
 def find_option_to_trade(underlying_spot, option_type, current_date, instruments_df):
     future_expiries = sorted([dt for dt in instruments_df['expiry'].unique() if dt >= current_date.date()])
-    if not future_expiries: return None, None
+    if not future_expiries: return None, None, None
 
     monthly_expiry = None
     for expiry in future_expiries:
         if expiry.is_month_end:
             monthly_expiry = expiry
             break
-    if not monthly_expiry: return None, None
+    if not monthly_expiry: return None, None, None
 
     filtered_options = instruments_df[(instruments_df['expiry'] == monthly_expiry) & (instruments_df['instrument_type'] == option_type)]
 
@@ -85,9 +137,9 @@ def find_option_to_trade(underlying_spot, option_type, current_date, instruments
     else:
         itm_options = filtered_options[filtered_options['strike'] < underlying_spot].sort_values(by='strike', ascending=False)
 
-    if len(itm_options) < TARGET_DELTA_PROXY_STRIKES: return None, None
+    if len(itm_options) < TARGET_DELTA_PROXY_STRIKES: return None, None, None
     selected_option = itm_options.iloc[TARGET_DELTA_PROXY_STRIKES - 1]
-    return selected_option['tradingsymbol'], selected_option['instrument_token']
+    return selected_option['tradingsymbol'], selected_option['instrument_token'], selected_option['lot_size']
 
 def get_option_price(token, timestamp, cache):
     if token in cache and not cache[token].empty:
@@ -120,64 +172,64 @@ def run_backtest(index_data, instruments_df, options_cache):
                 position = None
                 continue
 
-        is_reversal = False
-        if (row['low'] <= row['lower_band'] and position and position['type'] == 'CALL') or \
-           (row['high'] >= row['upper_band'] and position and position['type'] == 'PUT'):
-            is_reversal = True
-            exit_price = get_option_price(position['token'], row['date'], options_cache)
-            if exit_price:
-                pnl = (position['entry_premium'] - exit_price) * position['lot_size']
-                position.update({'exit_time': row['date'], 'exit_price': exit_price, 'pnl': pnl, 'exit_reason': 'Reversal'})
-                trade_log.append(position)
-                logging.info(f"Reversed {position['symbol']}. PnL: {pnl:.2f}")
-            position = None
+        if (row['low'] <= row['lower_band'] and (not position or position['type'] == 'CALL')) or \
+           (row['high'] >= row['upper_band'] and (not position or position['type'] == 'PUT')):
 
-        if not position:
-            option_type = None
-            if row['low'] <= row['lower_band']: option_type = 'PE'
-            elif row['high'] >= row['upper_band']: option_type = 'CE'
+            if position: # Reversal logic
+                exit_price = get_option_price(position['token'], row['date'], options_cache)
+                if exit_price:
+                    pnl = (position['entry_premium'] - exit_price) * position['lot_size']
+                    position.update({'exit_time': row['date'], 'exit_price': exit_price, 'pnl': pnl, 'exit_reason': 'Reversal'})
+                    trade_log.append(position)
+                    logging.info(f"Reversed {position['symbol']}. PnL: {pnl:.2f}")
+                position = None
 
-            if option_type:
-                option_symbol, token = find_option_to_trade(row['close'], option_type, row['date'], instruments_df)
-                if option_symbol:
-                    entry_premium = get_option_price(token, row['date'], options_cache)
-                    if entry_premium:
-                        lot_size = instruments_df[instruments_df['instrument_token'] == token].iloc[0]['lot_size']
-                        margin = (row['close'] * 0.15 + entry_premium) * lot_size # Simplified margin
-                        position = {'entry_time': row['date'], 'symbol': option_symbol, 'type': 'PUT' if option_type == 'PE' else 'CALL', 'entry_premium': entry_premium, 'token': token, 'lot_size': lot_size, 'margin': margin}
-                        logging.info(f"Sold {option_symbol} at {entry_premium}")
+            option_type = 'PE' if row['low'] <= row['lower_band'] else 'CE'
+            option_symbol, token, lot_size = find_option_to_trade(row['close'], option_type, row['date'].date(), instruments_df)
+
+            if option_symbol:
+                entry_premium = get_option_price(token, row['date'], options_cache)
+                if entry_premium:
+                    margin = (row['close'] * 0.15 + entry_premium) * lot_size
+                    position = {'entry_time': row['date'], 'symbol': option_symbol, 'type': 'PUT' if option_type == 'PE' else 'CALL', 'entry_premium': entry_premium, 'token': token, 'lot_size': lot_size, 'margin': margin}
+                    logging.info(f"Sold {option_symbol} at {entry_premium}")
 
     return pd.DataFrame(trade_log)
 
 if __name__ == "__main__":
-    if "YOUR_API_KEY" in [API_KEY, API_SECRET, ACCESS_TOKEN]:
-        logging.error("Please fill in your API credentials.")
+    if "YOUR_API_KEY" in [API_KEY, API_SECRET]:
+        logging.error("Please fill in your API_KEY and API_SECRET.")
     else:
-        kite = KiteConnect(api_key=API_KEY)
-        kite.set_access_token(ACCESS_TOKEN)
+        access_token = get_access_token_automated(API_KEY)
 
-        try:
-            index_token = get_instrument_token(kite, INDEX_SYMBOL, EXCHANGE_IND)
-            nfo_instruments = pd.DataFrame(kite.instruments(exchange=EXCHANGE_OPT))
-            nfo_instruments['expiry'] = pd.to_datetime(nfo_instruments['expiry']).dt.date
+        if access_token:
+            kite = KiteConnect(api_key=API_KEY)
+            kite.set_access_token(access_token)
 
-            from_date = datetime.now() - timedelta(days=59)
-            to_date = datetime.now()
+            try:
+                index_token = get_instrument_token(kite, INDEX_SYMBOL, EXCHANGE_IND)
+                nfo_instruments = pd.DataFrame(kite.instruments(exchange=EXCHANGE_OPT))
+                nfo_instruments['expiry'] = pd.to_datetime(nfo_instruments['expiry']).dt.date
 
-            index_data, options_cache = pre_fetch_all_data(kite, index_token, nfo_instruments, from_date, to_date)
+                from_date = datetime.strptime(FROM_DATE, '%Y-%m-%d')
+                to_date = datetime.strptime(TO_DATE, '%Y-%m-%d')
 
-            index_with_indicator = calculate_donchian_channel(index_data, DONCHIAN_PERIOD)
+                index_data, options_cache = pre_fetch_all_data(kite, index_token, nfo_instruments, from_date, to_date)
 
-            trade_log = run_backtest(index_with_indicator, nfo_instruments, options_cache)
+                index_with_indicator = calculate_donchian_channel(index_data, DONCHIAN_PERIOD)
 
-            if not trade_log.empty:
-                trade_log.to_csv(TRADE_LOG_FILE, index=False)
-                logging.info(f"Trade log saved to {TRADE_LOG_FILE}")
-                print("\n--- Backtest Summary ---")
-                print(trade_log)
-                print(f"\nTotal PnL: {trade_log['pnl'].sum():.2f}")
-            else:
-                logging.info("No trades were executed during the backtest.")
+                trade_log = run_backtest(index_with_indicator, nfo_instruments, options_cache)
 
-        except Exception as e:
-            logging.error(f"An error occurred: {e}", exc_info=True)
+                if not trade_log.empty:
+                    trade_log.to_csv(TRADE_LOG_FILE, index=False)
+                    logging.info(f"Trade log saved to {TRADE_LOG_FILE}")
+                    print("\n--- Backtest Summary ---")
+                    print(trade_log)
+                    print(f"\nTotal PnL: {trade_log['pnl'].sum():.2f}")
+                else:
+                    logging.info("No trades were executed during the backtest.")
+
+            except Exception as e:
+                logging.error(f"An error occurred: {e}", exc_info=True)
+        else:
+            logging.error("Could not obtain access token. Aborting backtest.")
