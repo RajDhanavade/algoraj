@@ -1,0 +1,5 @@
+kiteconnect
+pandas
+numpy
+flask
+requests

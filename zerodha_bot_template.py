@@ -3,6 +3,8 @@ import pandas as pd
 from kiteconnect import KiteConnect, KiteTicker
 import logging
 import threading
+import os
+import requests
 
 # --- 1. README: HOW TO USE THIS SCRIPT ---
 #
@@ -24,10 +26,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Credentials (FILL THESE IN) ---
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
-ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+# ACCESS_TOKEN is now passed automatically by `start_bot.py`
 
 # --- Mode Configuration ---
 TESTING_MODE = True # Set to True for safe testing, False for live trading with full capital.
+
+# --- Telegram Configuration (FILL THESE IN) ---
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
 # --- Trading Parameters ---
 TRADING_SYMBOL = "RELIANCE"
@@ -57,15 +63,35 @@ class ZerodhaWebSocketBot:
         self.lower_band = 0
         self.last_band_update = None
 
-        # --- Safety Override for Testing Mode ---
         self.quantity = 1 if testing_mode else QUANTITY
-        self.leverage = 1.0 if testing_mode else LEVERAGE
         if testing_mode:
-            logging.warning("TESTING MODE is ON. Trading with 1 share and no leverage.")
+            logging.warning("TESTING MODE is ON. Trading with 1 share.")
+            self.send_telegram_message("Bot started in TESTING MODE (1 share, no leverage).")
+        else:
+            self.send_telegram_message(f"Bot started in LIVE MODE ({self.quantity} shares).")
 
         self.kws.on_ticks = self.on_ticks
         self.kws.on_connect = self.on_connect
         self.kws.on_close = self.on_close
+
+    def send_telegram_message(self, message):
+        """Sends a message to a Telegram user or group."""
+        if "YOUR_TELEGRAM" in [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]:
+            logging.warning("Telegram credentials not set. Skipping notification.")
+            return
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+        try:
+            response = requests.post(url, json=payload)
+            if response.status_code != 200:
+                logging.error(f"Failed to send Telegram message: {response.text}")
+        except Exception as e:
+            logging.error(f"Exception while sending Telegram message: {e}")
 
     def _get_instrument_token(self):
         instruments = self.kite.instruments(exchange=EXCHANGE)
@@ -74,7 +100,7 @@ class ZerodhaWebSocketBot:
                 return instrument['instrument_token']
         raise ValueError(f"Instrument token for {TRADING_SYMBOL} not found.")
 
-    def place_order(self, transaction_type):
+    def place_order(self, transaction_type, ltp):
         try:
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR, exchange=EXCHANGE,
@@ -82,9 +108,14 @@ class ZerodhaWebSocketBot:
                 quantity=self.quantity, product=PRODUCT_TYPE, order_type=ORDER_TYPE
             )
             logging.info(f"Order placed: {transaction_type} {self.quantity} {TRADING_SYMBOL}, ID: {order_id}")
+
+            # --- Send Notification ---
+            trade_msg = f"*{transaction_type.upper()}* order placed for {self.quantity} {TRADING_SYMBOL} at approx. {ltp:.2f}."
+            self.send_telegram_message(trade_msg)
             return order_id
         except Exception as e:
             logging.error(f"Order placement failed: {e}")
+            self.send_telegram_message(f"ALERT: Order placement failed for {TRADING_SYMBOL}. Error: {e}")
             return None
 
     def update_donchian_bands(self):
@@ -115,21 +146,23 @@ class ZerodhaWebSocketBot:
             # Stop-Loss Check
             if pnl_pct <= -SYSTEM_STOP_LOSS_PCT:
                 logging.warning(f"STOP-LOSS triggered! PnL: {pnl_pct:.2f}%")
-                self.place_order(self.kite.TRANSACTION_TYPE_SELL)
+                self.send_telegram_message(f"🛑 *STOP-LOSS* triggered for {TRADING_SYMBOL} at {ltp:.2f}. PnL: {pnl_pct:.2f}%")
+                self.place_order(self.kite.TRANSACTION_TYPE_SELL, ltp)
                 self.position = None
                 return
 
             # Take-Profit Check
             if ltp >= self.upper_band:
                 logging.info("TAKE-PROFIT signal. Closing LONG position.")
-                self.place_order(self.kite.TRANSACTION_TYPE_SELL)
+                self.send_telegram_message(f"✅ *TAKE-PROFIT* for {TRADING_SYMBOL} at {ltp:.2f}. PnL: {pnl_pct:.2f}%")
+                self.place_order(self.kite.TRANSACTION_TYPE_SELL, ltp)
                 self.position = None
                 return
 
         # Entry Check
         if self.position is None and ltp <= self.lower_band:
             logging.info("BUY signal. Opening LONG position.")
-            self.place_order(self.kite.TRANSACTION_TYPE_BUY)
+            self.place_order(self.kite.TRANSACTION_TYPE_BUY, ltp)
             self.position = 'LONG'
             self.entry_price = ltp
 
@@ -159,8 +192,9 @@ class ZerodhaWebSocketBot:
                 break
 
 if __name__ == "__main__":
-    if "YOUR_API_KEY" in [API_KEY, API_SECRET, ACCESS_TOKEN]:
-        logging.error("Please fill in your API credentials in the script.")
+    access_token = os.getenv("ZERODHA_ACCESS_TOKEN")
+    if "YOUR_API_KEY" in [API_KEY, API_SECRET] or not access_token:
+        logging.error("Please fill in your API_KEY and API_SECRET in the `start_bot.py` script and run it to generate the access token.")
     else:
-        bot = ZerodhaWebSocketBot(API_KEY, API_SECRET, ACCESS_TOKEN, TESTING_MODE)
+        bot = ZerodhaWebSocketBot(API_KEY, API_SECRET, access_token, TESTING_MODE)
         bot.start()
