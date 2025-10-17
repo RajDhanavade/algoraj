@@ -209,7 +209,7 @@ if __name__ == "__main__":
             try:
                 index_token = get_instrument_token(kite, INDEX_SYMBOL, EXCHANGE_IND)
                 nfo_instruments = pd.DataFrame(kite.instruments(exchange=EXCHANGE_OPT))
-                nfo_instruments['expiry'] = pd.to_datetime(nfo_instruments['expiry']).dt.date
+                nfo_instruments['expiry'] = pd.to_datetime(nfo_instruments['expiry'])
 
                 from_date = datetime.strptime(FROM_DATE, '%Y-%m-%d')
                 to_date = datetime.strptime(TO_DATE, '%Y-%m-%d')
