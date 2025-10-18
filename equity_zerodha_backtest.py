@@ -20,7 +20,8 @@ EQUITY_SYMBOL = "RELIANCE"  # Change to the stock you want to test
 EXCHANGE = "NSE"
 TIMEFRAME = "5minute"
 DONCHIAN_PERIOD = 20
-QUANTITY = 10  # Number of shares to trade
+QUANTITY = 10         # Number of shares to trade
+STOP_LOSS_PCT = 2.0   # Stop-loss percentage
 
 # -- Script Settings --
 TRADE_LOG_FILE = 'equity_trades.csv'
@@ -94,8 +95,8 @@ def calculate_donchian_channel(data, period):
     data['lower_band'] = data['low'].rolling(period).min()
     return data
 
-def run_equity_backtest(data, quantity):
-    """Executes the backtest logic for the equity mean-reversion strategy."""
+def run_equity_backtest(data, quantity, stop_loss_pct):
+    """Executes the backtest logic for the equity mean-reversion strategy with a stop-loss."""
     logging.info("--- Starting Backtest Engine ---")
     trade_log = []
     position = None  # Can be 'LONG', 'SHORT', or None
@@ -103,42 +104,64 @@ def run_equity_backtest(data, quantity):
 
     for i in range(DONCHIAN_PERIOD, len(data)):
         row = data.iloc[i]
+        exit_reason = None
 
-        # Determine signal based on Donchian Channel
+        # 1. Check for Stop-Loss
+        if position is not None:
+            entry_price = position_details['entry_price']
+            if position == 'LONG':
+                stop_loss_price = entry_price * (1 - stop_loss_pct / 100)
+                if row['low'] <= stop_loss_price:
+                    exit_reason = 'Stop-Loss'
+                    exit_price = stop_loss_price
+            elif position == 'SHORT':
+                stop_loss_price = entry_price * (1 + stop_loss_pct / 100)
+                if row['high'] >= stop_loss_price:
+                    exit_reason = 'Stop-Loss'
+                    exit_price = stop_loss_price
+
+        # 2. Check for Reversal Signal
         signal = None
         if row['low'] <= row['lower_band']:
-            signal = 'LONG'  # Buy signal
+            signal = 'LONG'
         elif row['high'] >= row['upper_band']:
-            signal = 'SHORT' # Sell signal
+            signal = 'SHORT'
 
-        # Process reversal exits first
         if position is not None and signal is not None and signal != position:
+            exit_reason = 'Reversal'
+            exit_price = row['close']
+
+        # 3. Process Exits
+        if exit_reason:
             entry_price = position_details['entry_price']
             pnl = 0
 
             if position == 'LONG':
-                pnl = (row['close'] - entry_price) * quantity
+                pnl = (exit_price - entry_price) * quantity
             elif position == 'SHORT':
-                pnl = (entry_price - row['close']) * quantity
+                pnl = (entry_price - exit_price) * quantity
 
             trade_log.append({
                 'entry_time': position_details['entry_time'],
                 'exit_time': row['date'],
                 'entry_price': entry_price,
-                'exit_price': row['close'],
+                'exit_price': exit_price,
                 'type': position,
                 'quantity': quantity,
-                'pnl': pnl
+                'pnl': pnl,
+                'exit_reason': exit_reason
             })
-            logging.info(f"Reversal: Closed {position} position at {row['close']}. PnL: {pnl:.2f}")
+            logging.info(f"{exit_reason}: Closed {position} position at {exit_price:.2f}. PnL: {pnl:.2f}")
             position = None
             position_details = {}
 
-        # Process entries
+        # 4. Process Entries
         if position is None and signal is not None:
-            position = signal
-            position_details = {'entry_price': row['close'], 'entry_time': row['date']}
-            logging.info(f"Entered {signal} position at {row['close']}")
+            # If we just exited on the same candle, don't re-enter immediately
+            if not exit_reason:
+                position = signal
+                position_details = {'entry_price': row['close'], 'entry_time': row['date']}
+                logging.info(f"Entered {signal} position at {row['close']}")
 
     return pd.DataFrame(trade_log)
 
@@ -156,12 +179,21 @@ def calculate_performance_metrics(trade_log):
 
     win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
 
+    avg_win_pnl = winning_trades['pnl'].mean() if not winning_trades.empty else 0
+    avg_loss_pnl = losing_trades['pnl'].mean() if not losing_trades.empty else 0
+    max_win = winning_trades['pnl'].max() if not winning_trades.empty else 0
+    max_loss = losing_trades['pnl'].min() if not losing_trades.empty else 0
+
     print("\n--- Strategy Performance Metrics ---")
     print(f"Total Trades: {total_trades}")
+    print(f"Total PnL: {total_pnl:.2f}")
+    print(f"Win Rate: {win_rate:.2f}%")
     print(f"Winning Trades: {len(winning_trades)}")
     print(f"Losing Trades: {len(losing_trades)}")
-    print(f"Win Rate: {win_rate:.2f}%")
-    print(f"Total PnL: {total_pnl:.2f}")
+    print(f"Average Winning PnL: {avg_win_pnl:.2f}")
+    print(f"Average Losing PnL: {avg_loss_pnl:.2f}")
+    print(f"Maximum Profit on a Single Trade: {max_win:.2f}")
+    print(f"Maximum Loss on a Single Trade: {max_loss:.2f}")
     print("------------------------------------\n")
 
 
@@ -189,7 +221,7 @@ if __name__ == "__main__":
                 data_with_indicators = calculate_donchian_channel(equity_data, DONCHIAN_PERIOD)
 
                 # 4. Run the backtest
-                trade_log = run_equity_backtest(data_with_indicators, QUANTITY)
+                trade_log = run_equity_backtest(data_with_indicators, QUANTITY, STOP_LOSS_PCT)
 
                 # 5. Save trade log and calculate performance
                 if not trade_log.empty:
