@@ -3,7 +3,7 @@ import numpy as np
 from kiteconnect import KiteConnect
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, time as datetime_time
 import time
 import webbrowser
 import threading
@@ -24,7 +24,7 @@ QUANTITY = 10         # Number of shares to trade
 STOP_LOSS_PCT = 2.0   # Stop-loss percentage
 
 # -- Script Settings --
-TRADE_LOG_FILE = 'equity_trades.csv'
+TRADE_LOG_FILE = 'equity_intraday_trades.csv'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Web Server for Authentication ---
@@ -96,72 +96,73 @@ def calculate_donchian_channel(data, period):
     return data
 
 def run_equity_backtest(data, quantity, stop_loss_pct):
-    """Executes the backtest logic for the equity mean-reversion strategy with a stop-loss."""
-    logging.info("--- Starting Backtest Engine ---")
+    """Executes the intraday backtest logic with corrected time-based rules and state handling."""
+    logging.info("--- Starting Intraday Backtest Engine ---")
     trade_log = []
-    position = None  # Can be 'LONG', 'SHORT', or None
+    position = None
     position_details = {}
+
+    entry_start_time = datetime_time(9, 20)
+    entry_end_time = datetime_time(15, 20)
+    exit_time = datetime_time(15, 25)
 
     for i in range(DONCHIAN_PERIOD, len(data)):
         row = data.iloc[i]
-        exit_reason = None
+        current_time = row['date'].time()
 
-        # 1. Check for Stop-Loss
+        # --- Step 1: Handle Exits ---
+        just_exited_reason = None
         if position is not None:
-            entry_price = position_details['entry_price']
-            if position == 'LONG':
-                stop_loss_price = entry_price * (1 - stop_loss_pct / 100)
-                if row['low'] <= stop_loss_price:
-                    exit_reason = 'Stop-Loss'
-                    exit_price = stop_loss_price
-            elif position == 'SHORT':
-                stop_loss_price = entry_price * (1 + stop_loss_pct / 100)
-                if row['high'] >= stop_loss_price:
-                    exit_reason = 'Stop-Loss'
-                    exit_price = stop_loss_price
+            exit_price = None
 
-        # 2. Check for Reversal Signal
-        signal = None
-        if row['low'] <= row['lower_band']:
-            signal = 'LONG'
-        elif row['high'] >= row['upper_band']:
-            signal = 'SHORT'
+            # Determine exit reason
+            if current_time >= exit_time:
+                just_exited_reason = 'End-of-Day'
+                exit_price = row['open']
+            else:
+                entry_price = position_details['entry_price']
+                if position == 'LONG' and row['low'] <= entry_price * (1 - stop_loss_pct / 100):
+                    just_exited_reason = 'Stop-Loss'
+                    exit_price = entry_price * (1 - stop_loss_pct / 100)
+                elif position == 'SHORT' and row['high'] >= entry_price * (1 + stop_loss_pct / 100):
+                    just_exited_reason = 'Stop-Loss'
+                    exit_price = entry_price * (1 + stop_loss_pct / 100)
 
-        if position is not None and signal is not None and signal != position:
-            exit_reason = 'Reversal'
-            exit_price = row['close']
+            reversal_signal = None
+            if row['low'] <= row['lower_band']: reversal_signal = 'LONG'
+            elif row['high'] >= row['upper_band']: reversal_signal = 'SHORT'
 
-        # 3. Process Exits
-        if exit_reason:
-            entry_price = position_details['entry_price']
-            pnl = 0
+            if reversal_signal and reversal_signal != position and not just_exited_reason:
+                just_exited_reason = 'Reversal'
+                exit_price = row['close']
 
-            if position == 'LONG':
-                pnl = (exit_price - entry_price) * quantity
-            elif position == 'SHORT':
-                pnl = (entry_price - exit_price) * quantity
+            # Process the exit if a reason was found
+            if just_exited_reason:
+                entry_price = position_details['entry_price']
+                pnl = (exit_price - entry_price) * quantity if position == 'LONG' else (entry_price - exit_price) * quantity
 
-            trade_log.append({
-                'entry_time': position_details['entry_time'],
-                'exit_time': row['date'],
-                'entry_price': entry_price,
-                'exit_price': exit_price,
-                'type': position,
-                'quantity': quantity,
-                'pnl': pnl,
-                'exit_reason': exit_reason
-            })
-            logging.info(f"{exit_reason}: Closed {position} position at {exit_price:.2f}. PnL: {pnl:.2f}")
-            position = None
-            position_details = {}
+                trade_log.append({
+                    'entry_time': position_details['entry_time'], 'exit_time': row['date'],
+                    'entry_price': entry_price, 'exit_price': exit_price,
+                    'type': position, 'quantity': quantity, 'pnl': pnl, 'exit_reason': just_exited_reason
+                })
+                logging.info(f"{just_exited_reason}: Closed {position} position at {exit_price:.2f}. PnL: {pnl:.2f}")
+                position = None
+                position_details = {}
 
-        # 4. Process Entries
-        if position is None and signal is not None:
+        # --- Step 2: Handle Entries ---
+        if position is None and entry_start_time <= current_time <= entry_end_time:
+            entry_signal = None
+            if row['low'] <= row['lower_band']:
+                entry_signal = 'LONG'
+            elif row['high'] >= row['upper_band']:
+                entry_signal = 'SHORT'
+
             # Only enter if there was no exit on this candle OR the exit was a reversal
-            if not exit_reason or exit_reason == 'Reversal':
-                position = signal
+            if entry_signal and (just_exited_reason is None or just_exited_reason == 'Reversal'):
+                position = entry_signal
                 position_details = {'entry_price': row['close'], 'entry_time': row['date']}
-                logging.info(f"Entered {signal} position at {row['close']}")
+                logging.info(f"Entered {position} position at {row['close']}")
 
     return pd.DataFrame(trade_log)
 
