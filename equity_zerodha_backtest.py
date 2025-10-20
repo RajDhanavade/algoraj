@@ -95,6 +95,11 @@ def calculate_donchian_channel(data, period):
     data['lower_band'] = data['low'].rolling(period).min()
     return data
 
+def calculate_ema(data, period):
+    """Calculates the Exponential Moving Average."""
+    data[f'ema_{period}'] = data['close'].ewm(span=period, adjust=False).mean()
+    return data
+
 def run_equity_backtest(data, quantity, stop_loss_pct):
     """Executes the backtest logic for the equity mean-reversion strategy with a stop-loss."""
     logging.info("--- Starting Backtest Engine ---")
@@ -157,11 +162,15 @@ def run_equity_backtest(data, quantity, stop_loss_pct):
 
         # 4. Process Entries
         if position is None and signal is not None:
-            # Only enter if there was no exit on this candle OR the exit was a reversal
-            if not exit_reason or exit_reason == 'Reversal':
-                position = signal
-                position_details = {'entry_price': row['close'], 'entry_time': row['date']}
-                logging.info(f"Entered {signal} position at {row['close']}")
+            # Trend-Filtering Logic
+            if (signal == 'LONG' and row['close'] > row['ema_100']) or \
+               (signal == 'SHORT' and row['close'] < row['ema_100']):
+
+                # Only enter if there was no exit on this candle OR the exit was a reversal
+                if not exit_reason or exit_reason == 'Reversal':
+                    position = signal
+                    position_details = {'entry_price': row['close'], 'entry_time': row['date']}
+                    logging.info(f"Entered {signal} position at {row['close']}")
 
     return pd.DataFrame(trade_log)
 
@@ -219,6 +228,7 @@ if __name__ == "__main__":
 
                 # 3. Calculate indicators
                 data_with_indicators = calculate_donchian_channel(equity_data, DONCHIAN_PERIOD)
+                data_with_indicators = calculate_ema(data_with_indicators, 100)
 
                 # 4. Run the backtest
                 trade_log = run_equity_backtest(data_with_indicators, QUANTITY, STOP_LOSS_PCT)
