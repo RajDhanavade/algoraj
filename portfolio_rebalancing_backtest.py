@@ -4,6 +4,9 @@ import logging
 from datetime import datetime, timedelta
 import os
 import numpy as np
+import webbrowser
+from flask import Flask, request
+import threading
 
 try:
     from tabulate import tabulate
@@ -35,61 +38,69 @@ ASSETS = {
     }
 }
 
-# --- Manual Token Generation ---
+# --- Automated Token Generation ---
 ACCESS_TOKEN_FILE = "access_token.txt"
 
-def manual_login(kite):
-    """Guides the user through the manual login process."""
-    print("--- Manual Zerodha Login ---")
-    print(f"1. Go to the following URL: {kite.login_url()}")
-    redirect_url = input("2. After logging in, you will be redirected. Paste the full redirect URL here: ")
+app = Flask(__name__)
+kite = KiteConnect(api_key=API_KEY)
+access_token_container = {"token": None}
 
-    try:
-        request_token = redirect_url.split("request_token=")[1].split("&")[0]
-        session = kite.generate_session(request_token, api_secret=API_SECRET)
-        access_token = session["access_token"]
+@app.route("/callback")
+def callback():
+    request_token = request.args.get("request_token")
+    if request_token:
+        try:
+            session = kite.generate_session(request_token, api_secret=API_SECRET)
+            access_token = session["access_token"]
+            access_token_container["token"] = access_token
+            with open(ACCESS_TOKEN_FILE, "w") as f:
+                f.write(access_token)
+            logging.info("Access token generated and saved successfully.")
+            return "Access token generated successfully! You can close this tab."
+        except Exception as e:
+            logging.error(f"Error generating session: {e}")
+            return "Error generating access token. Please check the logs."
+    return "No request token found."
 
-        with open(ACCESS_TOKEN_FILE, "w") as f:
-            f.write(access_token)
-        logging.info("Access token generated and saved successfully.")
-        return access_token
-    except (IndexError, KeyError) as e:
-        logging.error(f"Could not extract request_token from the URL. Error: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Error generating session: {e}")
-        return None
+def run_flask_app():
+    app.run(port=5000)
+
+def automated_login():
+    """Automates the Kite Connect login process."""
+    print("Attempting automated login...")
+    login_url = kite.login_url()
+    webbrowser.open(login_url)
+
+    flask_thread = threading.Thread(target=run_flask_app)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    while access_token_container["token"] is None:
+        pass  # Wait for the token to be generated
+
+    return access_token_container["token"]
 
 # --- Kite Connect Initialization ---
 def initialize_kiteconnect():
-    """Initializes the KiteConnect client, with manual login if needed."""
-    kite = KiteConnect(api_key=API_KEY)
-
-    # Try to load access token from file
+    """Initializes the KiteConnect client, automating login if necessary."""
+    global ACCESS_TOKEN
     if os.path.exists(ACCESS_TOKEN_FILE):
-        with open(ACCESS_TOKEN_FILE, 'r') as f:
-            access_token = f.read().strip()
+        with open(ACCESS_TOKEN_FILE, "r") as f:
+            ACCESS_TOKEN = f.read().strip()
         logging.info("Loaded access token from file.")
     else:
-        access_token = manual_login(kite)
-
-    if not access_token:
-        logging.error("Failed to obtain access token. Exiting.")
-        return None
+        ACCESS_TOKEN = automated_login()
 
     try:
-        kite.set_access_token(access_token)
-        profile = kite.profile() # Test the access token
-        logging.info(f"Kite Connect session initialized for user: {profile['user_id']}")
+        kite.set_access_token(ACCESS_TOKEN)
+        logging.info("Kite Connect session initialized successfully.")
         return kite
     except Exception as e:
-        logging.error(f"Error with saved access token: {e}. Please try a new login.")
-        os.remove(ACCESS_TOKEN_FILE) # Remove invalid token file
-        access_token = manual_login(kite)
-        if not access_token:
-            logging.error("Failed to obtain access token on second attempt. Exiting.")
-            return None
-        kite.set_access_token(access_token)
+        logging.error(f"Error setting access token: {e}")
+        # If token is invalid, try to log in again
+        ACCESS_TOKEN = automated_login()
+        kite.set_access_token(ACCESS_TOKEN)
+        logging.info("Kite Connect session initialized successfully after re-login.")
         return kite
 
 # --- Data Fetching ---
