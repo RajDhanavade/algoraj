@@ -27,7 +27,9 @@ FIRST_CANDLE_END = time(9, 20)
 MIN_PRICE = 100
 MIN_AVG_VOLUME = 1_000_000
 MIN_ATR = 1.0
-TOP_N_STOCKS = 20
+TOP_N_STOCKS = 5
+INITIAL_CAPITAL = 500_000
+ALLOCATION_PER_TRADE = 100_000
 
 DATA_FILE = 'orb_data.pkl'
 
@@ -205,14 +207,16 @@ def run_backtest(data):
                         break
 
             if trade_entered:
-                pnl = (exit_price - entry_price) / entry_price if side == 'LONG' else (entry_price - exit_price) / entry_price
+                pnl_pct = (exit_price - entry_price) / entry_price if side == 'LONG' else (entry_price - exit_price) / entry_price
+                pnl_value = pnl_pct * ALLOCATION_PER_TRADE
                 trade_log.append({
                     'date': current_date,
                     'ticker': ticker,
                     'side': side,
                     'entry': entry_price,
                     'exit': exit_price,
-                    'pnl': pnl,
+                    'pnl_pct': pnl_pct,
+                    'pnl_val': pnl_value,
                     'reason': exit_reason
                 })
 
@@ -224,31 +228,37 @@ def analyze_results(trades):
         return
 
     print("\n--- Backtest Results ---")
+    print(f"Initial Capital: ₹{INITIAL_CAPITAL}")
+    print(f"Allocation per Trade: ₹{ALLOCATION_PER_TRADE}")
+    print(f"Top Quality Trades per Day: {TOP_N_STOCKS}")
+
     total_trades = len(trades)
-    win_rate = (trades['pnl'] > 0).sum() / total_trades * 100
-    avg_pnl = trades['pnl'].mean() * 100
-    total_pnl = trades['pnl'].sum() * 100
+    win_rate = (trades['pnl_pct'] > 0).sum() / total_trades * 100
+    total_pnl_val = trades['pnl_val'].sum()
+    roi = (total_pnl_val / INITIAL_CAPITAL) * 100
 
-    # Daily PnL (assuming equal allocation to each trade)
-    daily_pnl = trades.groupby('date')['pnl'].mean()
-    cumulative_returns = (1 + daily_pnl).cumprod()
+    # Daily PnL value sum
+    daily_pnl_val = trades.groupby('date')['pnl_val'].sum()
+    # Daily return on total capital
+    daily_returns = daily_pnl_val / INITIAL_CAPITAL
+    cumulative_returns = (1 + daily_returns).cumprod()
 
-    sharpe = (daily_pnl.mean() / daily_pnl.std()) * np.sqrt(252) if daily_pnl.std() != 0 else 0
+    sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0
 
     max_drawdown = (cumulative_returns / cumulative_returns.cummax() - 1).min() * 100
 
     print(f"Total Trades: {total_trades}")
     print(f"Win Rate: {win_rate:.2f}%")
-    print(f"Average PnL per Trade: {avg_pnl:.2f}%")
-    print(f"Total Cumulative PnL: {total_pnl:.2f}%")
+    print(f"Total Profit/Loss: ₹{total_pnl_val:.2f}")
+    print(f"Total ROI: {roi:.2f}%")
     print(f"Sharpe Ratio: {sharpe:.2f}")
     print(f"Max Drawdown: {max_drawdown:.2f}%")
 
     print("\n--- Best Trades ---")
-    print(trades.sort_values(by='pnl', ascending=False).head(5))
+    print(trades.sort_values(by='pnl_pct', ascending=False).head(5))
 
     print("\n--- Worst Trades ---")
-    print(trades.sort_values(by='pnl', ascending=True).head(5))
+    print(trades.sort_values(by='pnl_pct', ascending=True).head(5))
 
 if __name__ == "__main__":
     data = load_cached_data()
