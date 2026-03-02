@@ -149,7 +149,7 @@ def run_backtest(data):
 
             if prev_close > MIN_PRICE and prev_avg_vol > MIN_AVG_VOLUME and prev_atr > MIN_ATR:
                 rv = calculate_relative_volume(intraday_df, t_ns, current_date)
-                if rv >= 1.0:
+                if rv >= 1.5:
                     daily_candidates.append({'ticker': t_ns, 'rv': rv, 'atr': prev_atr})
 
         # Sort by RV (quality)
@@ -178,6 +178,9 @@ def run_backtest(data):
             entry_price = high_range if side == 'LONG' else low_range
             sl_distance = 0.5 * atr_14
             stop_loss = entry_price - sl_distance if side == 'LONG' else entry_price + sl_distance
+
+            # Target (Take Profit): R:R = 1:2
+            target_price = entry_price + (2.0 * sl_distance) if side == 'LONG' else entry_price - (2.0 * sl_distance)
 
             # Position Sizing: 0.5% risk of current capital
             risk_amount = current_capital * RISK_PER_TRADE_PCT
@@ -209,6 +212,16 @@ def run_backtest(data):
                     elif side == 'SHORT' and row['High'] > stop_loss:
                         exit_price = stop_loss
                         exit_reason = 'SL'
+                        break
+
+                    # Check Target (Take Profit)
+                    if side == 'LONG' and row['High'] > target_price:
+                        exit_price = target_price
+                        exit_reason = 'TARGET'
+                        break
+                    elif side == 'SHORT' and row['Low'] < target_price:
+                        exit_price = target_price
+                        exit_reason = 'TARGET'
                         break
 
                     # Exit at EOD
@@ -248,6 +261,8 @@ def analyze_results(trades):
     print(f"Initial Capital: ₹{INITIAL_CAPITAL:.2f}")
     print(f"Risk per Trade: {RISK_PER_TRADE_PCT*100}% of Account Balance")
     print(f"Stop Loss: 0.5 * ATR")
+    print(f"Target: 1.0 * ATR (R:R = 1:2)")
+    print(f"Relative Volume Threshold: 1.5")
 
     total_trades = len(trades)
     win_rate = (trades['pnl_pct'] > 0).sum() / total_trades * 100
