@@ -27,9 +27,8 @@ FIRST_CANDLE_END = time(9, 20)
 MIN_PRICE = 100
 MIN_AVG_VOLUME = 1_000_000
 MIN_ATR = 1.0
-TOP_N_STOCKS = 5
 INITIAL_CAPITAL = 500_000
-ALLOCATION_PER_TRADE = 100_000
+RISK_PER_TRADE_PCT = 0.005 # 0.5% of INITIAL_CAPITAL
 
 DATA_FILE = 'orb_data.pkl'
 
@@ -150,11 +149,16 @@ def run_backtest(data):
                 if rv >= 1.0:
                     daily_candidates.append({'ticker': t_ns, 'rv': rv, 'atr': prev_atr})
 
-        # Sort by RV and take top 20
-        daily_candidates = sorted(daily_candidates, key=lambda x: x['rv'], reverse=True)[:TOP_N_STOCKS]
+        # Sort by RV (quality)
+        daily_candidates = sorted(daily_candidates, key=lambda x: x['rv'], reverse=True)
+
+        remaining_capital = INITIAL_CAPITAL
 
         # Execute Trades
         for candidate in daily_candidates:
+            if remaining_capital <= 1000: # Don't bother with less than 1k
+                break
+
             ticker = candidate['ticker']
             atr_14 = candidate['atr']
 
@@ -172,7 +176,27 @@ def run_backtest(data):
             # Directional bias
             side = 'LONG' if close_p > open_p else 'SHORT'
             entry_price = high_range if side == 'LONG' else low_range
-            stop_loss = entry_price - (0.1 * atr_14) if side == 'LONG' else entry_price + (0.1 * atr_14)
+            sl_distance = 0.5 * atr_14
+            stop_loss = entry_price - sl_distance if side == 'LONG' else entry_price + sl_distance
+
+            # Position Sizing: 0.5% risk of total capital
+            risk_amount = INITIAL_CAPITAL * RISK_PER_TRADE_PCT
+            quantity = int(risk_amount / sl_distance) if sl_distance > 0 else 0
+
+            if quantity <= 0:
+                continue
+
+            trade_value = quantity * entry_price
+
+            # Check if we have enough capital
+            if trade_value > remaining_capital:
+                # Optional: fractional fill or just skip
+                quantity = int(remaining_capital / entry_price)
+                trade_value = quantity * entry_price
+                if quantity <= 0:
+                    continue
+
+            remaining_capital -= trade_value
 
             # Check for breakout after 9:20
             remaining_day = day_data[day_data.index.time > MARKET_OPEN]
@@ -185,7 +209,6 @@ def run_backtest(data):
                 if not trade_entered:
                     if side == 'LONG' and row['High'] > entry_price:
                         trade_entered = True
-                        # Assume entry at high_range (ORB break)
                     elif side == 'SHORT' and row['Low'] < entry_price:
                         trade_entered = True
 
@@ -208,11 +231,12 @@ def run_backtest(data):
 
             if trade_entered:
                 pnl_pct = (exit_price - entry_price) / entry_price if side == 'LONG' else (entry_price - exit_price) / entry_price
-                pnl_value = pnl_pct * ALLOCATION_PER_TRADE
+                pnl_value = pnl_pct * (quantity * entry_price)
                 trade_log.append({
                     'date': current_date,
                     'ticker': ticker,
                     'side': side,
+                    'quantity': quantity,
                     'entry': entry_price,
                     'exit': exit_price,
                     'pnl_pct': pnl_pct,
@@ -229,8 +253,8 @@ def analyze_results(trades):
 
     print("\n--- Backtest Results ---")
     print(f"Initial Capital: ₹{INITIAL_CAPITAL}")
-    print(f"Allocation per Trade: ₹{ALLOCATION_PER_TRADE}")
-    print(f"Top Quality Trades per Day: {TOP_N_STOCKS}")
+    print(f"Risk per Trade: {RISK_PER_TRADE_PCT*100}% of Initial Capital (₹{INITIAL_CAPITAL * RISK_PER_TRADE_PCT})")
+    print(f"Stop Loss: 0.5 * ATR")
 
     total_trades = len(trades)
     win_rate = (trades['pnl_pct'] > 0).sum() / total_trades * 100
@@ -253,6 +277,9 @@ def analyze_results(trades):
     print(f"Total ROI: {roi:.2f}%")
     print(f"Sharpe Ratio: {sharpe:.2f}")
     print(f"Max Drawdown: {max_drawdown:.2f}%")
+
+    print("\n--- Summary of All Trades ---")
+    print(trades[['date', 'ticker', 'side', 'quantity', 'entry', 'exit', 'pnl_pct', 'pnl_val', 'reason']])
 
     print("\n--- Best Trades ---")
     print(trades.sort_values(by='pnl_pct', ascending=False).head(5))
