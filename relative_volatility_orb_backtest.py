@@ -128,13 +128,16 @@ def run_backtest(data):
     all_dates = sorted(unique_dates)[15:] # Start after we have enough for RV
     trade_log = []
 
+    current_capital = INITIAL_CAPITAL
+
     for current_date in all_dates:
-        print(f"Processing {current_date}...")
+        print(f"Processing {current_date}... Capital: ₹{current_capital:.2f}")
         daily_candidates = []
 
         for ticker in SYMBOLS:
             t_ns = ticker + ".NS"
-            m = daily_metrics[t_ns]
+            m = daily_metrics.get(t_ns)
+            if m is None: continue
 
             # Use data from previous day for filtering
             past_data = m[m.index.date < current_date].tail(1)
@@ -152,13 +155,10 @@ def run_backtest(data):
         # Sort by RV (quality)
         daily_candidates = sorted(daily_candidates, key=lambda x: x['rv'], reverse=True)
 
-        remaining_capital = INITIAL_CAPITAL
+        day_pnl_val = 0
 
         # Execute Trades
         for candidate in daily_candidates:
-            if remaining_capital <= 1000: # Don't bother with less than 1k
-                break
-
             ticker = candidate['ticker']
             atr_14 = candidate['atr']
 
@@ -179,27 +179,15 @@ def run_backtest(data):
             sl_distance = 0.5 * atr_14
             stop_loss = entry_price - sl_distance if side == 'LONG' else entry_price + sl_distance
 
-            # Position Sizing: 0.5% risk of total capital
-            risk_amount = INITIAL_CAPITAL * RISK_PER_TRADE_PCT
+            # Position Sizing: 0.5% risk of current capital
+            risk_amount = current_capital * RISK_PER_TRADE_PCT
             quantity = int(risk_amount / sl_distance) if sl_distance > 0 else 0
 
             if quantity <= 0:
                 continue
 
-            trade_value = quantity * entry_price
-
-            # Check if we have enough capital
-            if trade_value > remaining_capital:
-                # Optional: fractional fill or just skip
-                quantity = int(remaining_capital / entry_price)
-                trade_value = quantity * entry_price
-                if quantity <= 0:
-                    continue
-
-            remaining_capital -= trade_value
-
-            # Check for breakout after 9:20
-            remaining_day = day_data[day_data.index.time > MARKET_OPEN]
+            # Check for breakout starting from 9:20
+            remaining_day = day_data[day_data.index.time >= FIRST_CANDLE_END]
 
             trade_entered = False
             exit_reason = 'EOD'
@@ -232,6 +220,7 @@ def run_backtest(data):
             if trade_entered:
                 pnl_pct = (exit_price - entry_price) / entry_price if side == 'LONG' else (entry_price - exit_price) / entry_price
                 pnl_value = pnl_pct * (quantity * entry_price)
+                day_pnl_val += pnl_value
                 trade_log.append({
                     'date': current_date,
                     'ticker': ticker,
@@ -241,8 +230,12 @@ def run_backtest(data):
                     'exit': exit_price,
                     'pnl_pct': pnl_pct,
                     'pnl_val': pnl_value,
-                    'reason': exit_reason
+                    'reason': exit_reason,
+                    'capital': current_capital
                 })
+
+        # Update capital for the next day
+        current_capital += day_pnl_val
 
     return pd.DataFrame(trade_log)
 
@@ -252,19 +245,28 @@ def analyze_results(trades):
         return
 
     print("\n--- Backtest Results ---")
-    print(f"Initial Capital: ₹{INITIAL_CAPITAL}")
-    print(f"Risk per Trade: {RISK_PER_TRADE_PCT*100}% of Initial Capital (₹{INITIAL_CAPITAL * RISK_PER_TRADE_PCT})")
+    print(f"Initial Capital: ₹{INITIAL_CAPITAL:.2f}")
+    print(f"Risk per Trade: {RISK_PER_TRADE_PCT*100}% of Account Balance")
     print(f"Stop Loss: 0.5 * ATR")
 
     total_trades = len(trades)
     win_rate = (trades['pnl_pct'] > 0).sum() / total_trades * 100
     total_pnl_val = trades['pnl_val'].sum()
-    roi = (total_pnl_val / INITIAL_CAPITAL) * 100
+    final_capital = INITIAL_CAPITAL + total_pnl_val
+    total_return = (final_capital / INITIAL_CAPITAL - 1) * 100
 
     # Daily PnL value sum
     daily_pnl_val = trades.groupby('date')['pnl_val'].sum()
-    # Daily return on total capital
-    daily_returns = daily_pnl_val / INITIAL_CAPITAL
+
+    # To calculate metrics correctly with compounding, we need the daily capital
+    # Let's reconstruct daily returns
+    daily_equity = [INITIAL_CAPITAL]
+    for pnl in daily_pnl_val:
+        daily_equity.append(daily_equity[-1] + pnl)
+
+    daily_equity = pd.Series(daily_equity)
+    daily_returns = daily_equity.pct_change().dropna()
+
     cumulative_returns = (1 + daily_returns).cumprod()
 
     sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() != 0 else 0
@@ -274,7 +276,8 @@ def analyze_results(trades):
     print(f"Total Trades: {total_trades}")
     print(f"Win Rate: {win_rate:.2f}%")
     print(f"Total Profit/Loss: ₹{total_pnl_val:.2f}")
-    print(f"Total ROI: {roi:.2f}%")
+    print(f"Final Capital: ₹{final_capital:.2f}")
+    print(f"Total Return: {total_return:.2f}%")
     print(f"Sharpe Ratio: {sharpe:.2f}")
     print(f"Max Drawdown: {max_drawdown:.2f}%")
 
